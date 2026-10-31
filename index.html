@@ -316,36 +316,191 @@ function makeJsonLayerStyleForPlates(feature) {
 
 <script>
 (function() {
-    function readPrefs() {
+    var MAP_PREFS_KEY = 'ingv_map_prefs';
+    var MAP_VISIBILITY_KEY = 'ingv_map_layer_visibility';
+
+    function readJSON(key, fallback) {
         try {
-            return JSON.parse(localStorage.getItem('ingv_map_prefs') || '{}');
+            var raw = localStorage.getItem(key);
+            return raw ? JSON.parse(raw) : fallback;
         } catch (e) {
-            return {};
+            return fallback;
         }
     }
 
-    function savePrefs(pref) {
+    function writeJSON(key, value) {
         try {
-            localStorage.setItem('ingv_map_prefs', JSON.stringify(pref));
+            localStorage.setItem(key, JSON.stringify(value));
         } catch (e) {
             console.warn('Unable to save map preferences:', e);
         }
     }
 
-    if (typeof map !== 'undefined' && map && typeof L !== 'undefined') {
-        var saved = readPrefs();
-        if (saved && saved.center && Array.isArray(saved.center) && saved.center.length === 2 && saved.zoom !== undefined) {
-            map.setView([saved.center[0], saved.center[1]], Number(saved.zoom), { animate: false });
+    function getLayerEntries() {
+        if (!window.layersControl || !window.layersControl._layers) {
+            return [];
         }
 
-        map.on('moveend zoomend', function() {
-            var center = map.getCenter();
-            savePrefs({
-                center: [Number(center.lat.toFixed(5)), Number(center.lng.toFixed(5))],
-                zoom: map.getZoom()
+        var entries = [];
+        Object.keys(window.layersControl._layers).forEach(function(key) {
+            var entry = window.layersControl._layers[key];
+            if (!entry || !entry.layer) {
+                return;
+            }
+            var name = entry.name || entry.layerName || key;
+            entries.push({
+                name: name,
+                layer: entry.layer,
+                overlay: !!entry.overlay
             });
         });
+        return entries;
     }
+
+    function applyBaseLayer(name) {
+        if (!window.map || !window.layersControl || !name) {
+            return;
+        }
+
+        var entries = getLayerEntries();
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            if (!entry.overlay && entry.name === name) {
+                var currentBase = null;
+                for (var j = 0; j < entries.length; j++) {
+                    if (!entries[j].overlay && window.map.hasLayer(entries[j].layer)) {
+                        currentBase = entries[j].layer;
+                        break;
+                    }
+                }
+                if (currentBase !== entry.layer) {
+                    if (currentBase) {
+                        window.map.removeLayer(currentBase);
+                    }
+                    window.map.addLayer(entry.layer);
+                }
+                return;
+            }
+        }
+    }
+
+    function applyOverlayVisibility(overlays) {
+        if (!window.map || !window.layersControl || !overlays) {
+            return;
+        }
+
+        var entries = getLayerEntries();
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            if (!entry.overlay) {
+                continue;
+            }
+            var shouldBeVisible = Object.prototype.hasOwnProperty.call(overlays, entry.name) ? !!overlays[entry.name] : window.map.hasLayer(entry.layer);
+            if (shouldBeVisible && !window.map.hasLayer(entry.layer)) {
+                window.map.addLayer(entry.layer);
+            } else if (!shouldBeVisible && window.map.hasLayer(entry.layer)) {
+                window.map.removeLayer(entry.layer);
+            }
+        }
+    }
+
+    function persistMapState() {
+        if (!window.map || !window.layersControl) {
+            return;
+        }
+
+        var entries = getLayerEntries();
+        var selectedBase = null;
+        var overlayStates = {};
+
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            if (entry.overlay) {
+                overlayStates[entry.name] = !!window.map.hasLayer(entry.layer);
+            } else if (window.map.hasLayer(entry.layer)) {
+                selectedBase = entry.name;
+            }
+        }
+
+        writeJSON(MAP_PREFS_KEY, {
+            center: [Number(window.map.getCenter().lat.toFixed(5)), Number(window.map.getCenter().lng.toFixed(5))],
+            zoom: window.map.getZoom(),
+            baseLayerName: selectedBase || 'Mappa stradale (Esri)',
+            activeLayers: overlayStates
+        });
+
+        writeJSON(MAP_VISIBILITY_KEY, {
+            baseLayerName: selectedBase || 'Mappa stradale (Esri)',
+            overlays: overlayStates
+        });
+    }
+
+    function restoreMapState() {
+        if (!window.map || !window.layersControl) {
+            return;
+        }
+
+        var savedMap = readJSON(MAP_PREFS_KEY, {});
+        var savedVisibility = readJSON(MAP_VISIBILITY_KEY, {});
+        var baseLayerName = savedVisibility.baseLayerName || savedMap.baseLayerName;
+        var overlays = savedVisibility.overlays || savedMap.activeLayers || {};
+
+        if (savedMap && savedMap.center && Array.isArray(savedMap.center) && savedMap.center.length === 2 && savedMap.zoom !== undefined) {
+            window.map.setView([savedMap.center[0], savedMap.center[1]], Number(savedMap.zoom), { animate: false });
+        }
+
+        if (baseLayerName) {
+            applyBaseLayer(baseLayerName);
+        }
+        if (Object.keys(overlays).length) {
+            applyOverlayVisibility(overlays);
+        }
+    }
+
+    function bindListeners() {
+        if (!window.map) {
+            return;
+        }
+        window.map.on('moveend zoomend', function() {
+            persistMapState();
+        });
+        window.map.on('baselayerchange', function() {
+            persistMapState();
+        });
+        window.map.on('overlayadd overlayremove', function() {
+            persistMapState();
+        });
+    }
+
+    function init() {
+        if (!window.map || !window.layersControl) {
+            return;
+        }
+        bindListeners();
+        restoreMapState();
+        setTimeout(function() {
+            persistMapState();
+            restoreMapState();
+        }, 150);
+        setTimeout(function() {
+            persistMapState();
+            restoreMapState();
+        }, 800);
+    }
+
+    var tries = 0;
+    function waitForMap() {
+        if (window.map && window.layersControl) {
+            init();
+            return;
+        }
+        tries += 1;
+        if (tries < 40) {
+            setTimeout(waitForMap, 200);
+        }
+    }
+
+    waitForMap();
 })();
 </script>
 
